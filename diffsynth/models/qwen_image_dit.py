@@ -4,6 +4,7 @@ from typing import Tuple, Optional, Union, List
 from einops import rearrange
 from .sd3_dit import TimestepEmbeddings, RMSNorm
 from .flux_dit import AdaLayerNorm
+from ..vram_management import gradient_checkpoint_forward 
 
 try:
     import flash_attn_interface
@@ -63,8 +64,8 @@ class QwenEmbedRope(nn.Module):
         super().__init__()
         self.theta = theta
         self.axes_dim = axes_dim
-        pos_index = torch.arange(4096)
-        neg_index = torch.arange(4096).flip(0) * -1 - 1
+        pos_index = torch.arange(1024)
+        neg_index = torch.arange(1024).flip(0) * -1 - 1
         self.pos_freqs = torch.cat([
             self.rope_params(pos_index, self.axes_dim[0], self.theta),
             self.rope_params(pos_index, self.axes_dim[1], self.theta),
@@ -127,102 +128,49 @@ class QwenEmbedRope(nn.Module):
             self.pos_freqs = self.pos_freqs.to(device)
             self.neg_freqs = self.neg_freqs.to(device)
 
-        vid_freqs = []
-        max_vid_index = 0
-        for idx, fhw in enumerate(video_fhw):
-            frame, height, width = fhw
-            rope_key = f"{idx}_{height}_{width}"
+        if isinstance(video_fhw, list):
+            video_fhw = video_fhw[0]
+        frame, height, width = video_fhw
+        rope_key = f"{frame}_{height}_{width}"
 
-            if rope_key not in self.rope_cache:
-                seq_lens = frame * height * width
-                freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
-                freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
-                freqs_frame = freqs_pos[0][idx : idx + frame].view(frame, 1, 1, -1).expand(frame, height, width, -1)
-                if self.scale_rope:
-                    freqs_height = torch.cat(
-                        [freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]], dim=0
-                    )
-                    freqs_height = freqs_height.view(1, height, 1, -1).expand(frame, height, width, -1)
-                    freqs_width = torch.cat([freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]], dim=0)
-                    freqs_width = freqs_width.view(1, 1, width, -1).expand(frame, height, width, -1)
-
-                else:
-                    freqs_height = freqs_pos[1][:height].view(1, height, 1, -1).expand(frame, height, width, -1)
-                    freqs_width = freqs_pos[2][:width].view(1, 1, width, -1).expand(frame, height, width, -1)
-
-                freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(seq_lens, -1)
-                self.rope_cache[rope_key] = freqs.clone().contiguous()
-            vid_freqs.append(self.rope_cache[rope_key])
-
+        if rope_key not in self.rope_cache:
+            seq_lens = frame * height * width
+            freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+            freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+            freqs_frame = freqs_pos[0][:frame].view(frame, 1, 1, -1).expand(frame, height, width, -1)
             if self.scale_rope:
-                max_vid_index = max(height // 2, width // 2, max_vid_index)
+                freqs_height = torch.cat(
+                    [
+                        freqs_neg[1][-(height - height//2):],
+                        freqs_pos[1][:height//2]
+                    ], 
+                    dim=0
+                )
+                freqs_height = freqs_height.view(1, height, 1, -1).expand(frame, height, width, -1)
+                freqs_width = torch.cat(
+                    [
+                        freqs_neg[2][-(width - width//2):],
+                        freqs_pos[2][:width//2]
+                    ], 
+                    dim=0
+                )
+                freqs_width = freqs_width.view(1, 1, width, -1).expand(frame, height, width, -1)
+                
             else:
-                max_vid_index = max(height, width, max_vid_index)
+                freqs_height = freqs_pos[1][:height].view(1, height, 1, -1).expand(frame, height, width, -1)
+                freqs_width = freqs_pos[2][:width].view(1, 1, width, -1).expand(frame, height, width, -1)
+            
+            freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(seq_lens, -1)
+            self.rope_cache[rope_key] = freqs.clone().contiguous()
+        vid_freqs = self.rope_cache[rope_key]
+
+        if self.scale_rope:
+            max_vid_index = max(height // 2, width // 2)
+        else:
+            max_vid_index = max(height, width)
 
         max_len = max(txt_seq_lens)
-        txt_freqs = self.pos_freqs[max_vid_index : max_vid_index + max_len, ...]
-        vid_freqs = torch.cat(vid_freqs, dim=0)
-
-        return vid_freqs, txt_freqs
-
-
-    def forward_sampling(self, video_fhw, txt_seq_lens, device):
-        self._expand_pos_freqs_if_needed(video_fhw, txt_seq_lens)
-        if self.pos_freqs.device != device:
-            self.pos_freqs = self.pos_freqs.to(device)
-            self.neg_freqs = self.neg_freqs.to(device)
-
-        vid_freqs = []
-        max_vid_index = 0
-        for idx, fhw in enumerate(video_fhw):
-            frame, height, width = fhw
-            rope_key = f"{idx}_{height}_{width}"
-            if idx > 0 and f"{0}_{height}_{width}" not in self.rope_cache:
-                frame_0, height_0, width_0 = video_fhw[0]
-
-                rope_key_0 = f"0_{height_0}_{width_0}"
-                spatial_freqs_0 = self.rope_cache[rope_key_0].reshape(frame_0, height_0, width_0, -1)
-                h_indices = torch.linspace(0, height_0 - 1, height).long()
-                w_indices = torch.linspace(0, width_0 - 1, width).long()
-                h_grid, w_grid = torch.meshgrid(h_indices, w_indices, indexing='ij')
-                sampled_rope = spatial_freqs_0[:, h_grid, w_grid, :]
-
-                freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
-                freqs_frame = freqs_pos[0][idx : idx + frame].view(frame, 1, 1, -1).expand(frame, height, width, -1)
-                sampled_rope[:, :, :, :freqs_frame.shape[-1]] = freqs_frame
-
-                seq_lens = frame * height * width
-                self.rope_cache[rope_key] = sampled_rope.reshape(seq_lens, -1).clone()
-            if rope_key not in self.rope_cache:
-                seq_lens = frame * height * width
-                freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
-                freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
-                freqs_frame = freqs_pos[0][idx : idx + frame].view(frame, 1, 1, -1).expand(frame, height, width, -1)
-                if self.scale_rope:
-                    freqs_height = torch.cat(
-                        [freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]], dim=0
-                    )
-                    freqs_height = freqs_height.view(1, height, 1, -1).expand(frame, height, width, -1)
-                    freqs_width = torch.cat([freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]], dim=0)
-                    freqs_width = freqs_width.view(1, 1, width, -1).expand(frame, height, width, -1)
-
-                else:
-                    freqs_height = freqs_pos[1][:height].view(1, height, 1, -1).expand(frame, height, width, -1)
-                    freqs_width = freqs_pos[2][:width].view(1, 1, width, -1).expand(frame, height, width, -1)
-
-                freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(seq_lens, -1)
-                self.rope_cache[rope_key] = freqs.clone()
-            vid_freqs.append(self.rope_cache[rope_key].contiguous())
-
-            if self.scale_rope:
-                max_vid_index = max(height // 2, width // 2, max_vid_index)
-            else:
-                max_vid_index = max(height, width, max_vid_index)
-
-        max_len = max(txt_seq_lens)
-        txt_freqs = self.pos_freqs[max_vid_index : max_vid_index + max_len, ...]
-        vid_freqs = torch.cat(vid_freqs, dim=0)
-
+        txt_freqs = self.pos_freqs[max_vid_index: max_vid_index + max_len, ...]
         return vid_freqs, txt_freqs
 
 
@@ -467,7 +415,6 @@ class QwenImageDiT(torch.nn.Module):
         image_start = sum(seq_lens)
         image_end = total_seq_len
         cumsum = [0]
-        single_image_seq = image_end - image_start
         for length in seq_lens:
             cumsum.append(cumsum[-1] + length)
         for i in range(N):
@@ -475,9 +422,6 @@ class QwenImageDiT(torch.nn.Module):
             prompt_end = cumsum[i+1]
             image_mask = torch.sum(patched_masks[i], dim=-1) > 0
             image_mask = image_mask.unsqueeze(1).repeat(1, seq_lens[i], 1)
-            # repeat image mask to match the single image sequence length
-            repeat_time = single_image_seq // image_mask.shape[-1]
-            image_mask = image_mask.repeat(1, 1, repeat_time)
             # prompt update with image
             attention_mask[:, prompt_start:prompt_end, image_start:image_end] = image_mask
             # image update with prompt
@@ -497,41 +441,110 @@ class QwenImageDiT(torch.nn.Module):
         attention_mask = attention_mask.to(device=latents.device, dtype=latents.dtype).unsqueeze(1)
 
         return all_prompt_emb, image_rotary_emb, attention_mask
-
-
+        
     def forward(
         self,
-        latents=None,
-        timestep=None,
-        prompt_emb=None,
-        prompt_emb_mask=None,
-        height=None,
-        width=None,
-    ):
-        img_shapes = [(latents.shape[0], latents.shape[2]//2, latents.shape[3]//2)]
+        *,
+        latents: torch.Tensor, 
+        timestep: torch.Tensor | float, 
+        prompt_emb: torch.Tensor, 
+        prompt_emb_mask: torch.Tensor,
+        height: int,
+        width: int,
+
+        use_gradient_checkpointing: bool = False,
+        use_gradient_checkpointing_offload: bool = False,
+        enable_fp8_attention: bool = False,
+
+        entity_prompt_emb: Optional[List[torch.Tensor]] = None, 
+        entity_prompt_emb_mask: Optional[List[torch.Tensor]] = None, 
+        entity_masks: Optional[torch.Tensor] = None, 
+
+        blockwise_controlnet: Optional[torch.nn.Module] = None,
+        blockwise_controlnet_conditioning: Optional[dict] = None,
+        blockwise_controlnet_inputs: Optional[dict] = None,
+        progress_id: int = 0,
+        num_inference_steps: int = 1,
+
+        attention_mask: Optional[torch.Tensor] = None,
+        return_image: bool = False,
+        **kwargs
+    ) -> torch.Tensor:
+        dev, dt = latents.device, latents.dtype
+        prompt_emb = prompt_emb.to(dev, dt, non_blocking=True)
+        prompt_emb_mask = prompt_emb_mask.to(dev, non_blocking=True)
+
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor(timestep, device=dev, dtype=dt)
+        else:
+            timestep = timestep.to(device=dev, dtype=dt)
+        B = latents.shape[0]
+        if timestep.ndim == 0:
+            timestep = timestep.expand(B)
+        elif timestep.shape[0] != B:
+            timestep = timestep.view(-1)[0].expand(B)
+
+        timestep_scaled = timestep / 1000
+
+        img_shapes = [(latents.shape[0], latents.shape[2] // 2, latents.shape[3] // 2)]
         txt_seq_lens = prompt_emb_mask.sum(dim=1).tolist()
-        
-        image = rearrange(latents, "B C (H P) (W Q) -> B (H W) (C P Q)", H=height//16, W=width//16, P=2, Q=2)
-        image = self.img_in(image)
-        text = self.txt_in(self.txt_norm(prompt_emb))
 
-        conditioning = self.time_text_embed(timestep, image.dtype)
+        image = rearrange(
+            latents, "B C (H P) (W Q) -> B (H W) (C P Q)",
+            H=height // 16, W=width // 16, P=2, Q=2
+        ).contiguous()
+        image = self.img_in(image) 
+        text = self.txt_in(self.txt_norm(prompt_emb)) 
 
-        image_rotary_emb = self.pos_embed(img_shapes, txt_seq_lens, device=latents.device)
+        conditioning = self.time_text_embed(timestep_scaled, image.dtype)
 
-        for block in self.transformer_blocks:
-            text, image = block(
+        # rotary embeddings 
+        if entity_prompt_emb is not None and entity_prompt_emb_mask is not None and entity_masks is not None:
+            text, image_rotary_emb, attention_mask = self.process_entity_masks(
+                latents, prompt_emb, prompt_emb_mask,
+                entity_prompt_emb, entity_prompt_emb_mask,
+                entity_masks, height, width, image, img_shapes
+            )
+        else:
+            image_rotary_emb = self.pos_embed(img_shapes, txt_seq_lens, device=dev)
+
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device=dev, dtype=image.dtype)
+
+        if blockwise_controlnet_conditioning is not None and blockwise_controlnet is not None:
+            blockwise_controlnet_conditioning = blockwise_controlnet.preprocess(
+                blockwise_controlnet_inputs, blockwise_controlnet_conditioning
+            )
+
+        for blk_id, blk in enumerate(self.transformer_blocks):
+            text, image = gradient_checkpoint_forward(
+                blk,
+                use_gradient_checkpointing,
+                use_gradient_checkpointing_offload,
                 image=image,
                 text=text,
                 temb=conditioning,
                 image_rotary_emb=image_rotary_emb,
+                attention_mask=attention_mask,
+                enable_fp8_attention=enable_fp8_attention,
             )
-        
+            if blockwise_controlnet_conditioning is not None and blockwise_controlnet is not None:
+                image = image + blockwise_controlnet.blockwise_forward(
+                    image=image, conditionings=blockwise_controlnet_conditioning,
+                    controlnet_inputs=blockwise_controlnet_inputs, block_id=blk_id,
+                    progress_id=progress_id, num_inference_steps=num_inference_steps,
+                )
+
         image = self.norm_out(image, conditioning)
-        image = self.proj_out(image)
-        
-        latents = rearrange(image, "B (H W) (C P Q) -> B C (H P) (W Q)", H=height//16, W=width//16, P=2, Q=2)
-        return image
+        image = self.proj_out(image)  # [B, (H/16*W/16), 64]
+        if return_image:
+            return image
+
+        latents_out = rearrange(
+            image, "B (H W) (C P Q) -> B C (H P) (W Q)",
+            H=height // 16, W=width // 16, P=2, Q=2
+        ).contiguous()
+        return latents_out
     
     @staticmethod
     def state_dict_converter():

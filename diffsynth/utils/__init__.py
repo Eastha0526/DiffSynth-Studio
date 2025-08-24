@@ -139,20 +139,6 @@ class BasePipeline(torch.nn.Module):
             else:
                 model.eval()
                 model.requires_grad_(False)
-                
-    
-    def blend_with_mask(self, base, addition, mask):
-        return base * (1 - mask) + addition * mask
-    
-    
-    def step(self, scheduler, latents, progress_id, noise_pred, input_latents=None, inpaint_mask=None, **kwargs):
-        timestep = scheduler.timesteps[progress_id]
-        if inpaint_mask is not None:
-            noise_pred_expected = scheduler.return_to_timestep(scheduler.timesteps[progress_id], latents, input_latents)
-            noise_pred = self.blend_with_mask(noise_pred_expected, noise_pred, inpaint_mask)
-        latents_next = scheduler.step(noise_pred, timestep, latents)
-        return latents_next
-
 
 
 @dataclass
@@ -259,7 +245,7 @@ class PipelineUnitRunner:
             processor_outputs = unit.process(pipe, **processor_inputs)
             inputs_posi.update(processor_outputs)
             # Negative side
-            if inputs_shared["cfg_scale"] != 1:
+            if inputs_shared.get("cfg_scale", 1) != 1:
                 processor_inputs = {name: inputs_nega.get(name_) for name, name_ in unit.input_params_nega.items()}
                 if unit.input_params is not None:
                     for name in unit.input_params:
@@ -270,6 +256,9 @@ class PipelineUnitRunner:
                 inputs_nega.update(processor_outputs)
         else:
             processor_inputs = {name: inputs_shared.get(name) for name in unit.input_params}
-            processor_outputs = unit.process(pipe, **processor_inputs)
+            try:
+                processor_outputs = unit.process(pipe, **processor_inputs)
+            except:
+                processor_outputs = {}
             inputs_shared.update(processor_outputs)
         return inputs_shared, inputs_posi, inputs_nega

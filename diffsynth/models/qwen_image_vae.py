@@ -700,22 +700,35 @@ class QwenImageVAE(torch.nn.Module):
             2.8251,
             1.9160,
         ]
-        self.mean = torch.tensor(mean).view(1, 16, 1, 1, 1)
-        self.std = 1 / torch.tensor(std).view(1, 16, 1, 1, 1)
+        self.register_buffer("mean", torch.tensor(mean).view(1, 16, 1, 1, 1), persistent=False)
+        self.register_buffer("std", (1 / torch.tensor(std)).view(1, 16, 1, 1, 1), persistent=False)
+
+    def _cast_input_like_module(self, x: torch.Tensor) -> torch.Tensor:
+        # Cast once, before any conv: avoids CPU bf16 -> CUDA op mismatches
+        ref_param = next(self.parameters(), None)
+        if ref_param is None:
+            return x
+        if x.device != ref_param.device or x.dtype != ref_param.dtype:
+            x = x.to(device=ref_param.device, dtype=ref_param.dtype, non_blocking=True)
+        return x
 
     def encode(self, x, **kwargs):
-        x = x.unsqueeze(2)
+        x = self._cast_input_like_module(x)
+        x = x.unsqueeze(2).contiguous()  # [B,C,T=1,H,W] for Conv3d
         x = self.encoder(x)
         x = self.quant_conv(x)
         x = x[:, :16]
-        mean, std = self.mean.to(dtype=x.dtype, device=x.device), self.std.to(dtype=x.dtype, device=x.device)
+        mean = self.mean.to(dtype=x.dtype)
+        std  = self.std.to(dtype=x.dtype)
         x = (x - mean) * std
         x = x.squeeze(2)
         return x
     
     def decode(self, x, **kwargs):
-        x = x.unsqueeze(2)
-        mean, std = self.mean.to(dtype=x.dtype, device=x.device), self.std.to(dtype=x.dtype, device=x.device)
+        x = self._cast_input_like_module(x)
+        x = x.unsqueeze(2).contiguous()
+        mean = self.mean.to(dtype=x.dtype)
+        std  = self.std.to(dtype=x.dtype)
         x = x / std + mean
         x = self.post_quant_conv(x)
         x = self.decoder(x)

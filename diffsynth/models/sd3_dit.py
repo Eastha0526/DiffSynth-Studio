@@ -20,7 +20,7 @@ class RMSNorm(torch.nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
         hidden_states = hidden_states.to(input_dtype)
         if self.weight is not None:
-            hidden_states = hidden_states * self.weight
+            hidden_states = hidden_states * self.weight.to(device=hidden_states.device)
         return hidden_states
 
 

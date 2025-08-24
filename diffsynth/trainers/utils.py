@@ -4,9 +4,34 @@ from PIL import Image
 import pandas as pd
 from tqdm import tqdm
 from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs
+from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration
+import datetime
+import time
+
+import torch, math
+
+def _fmt_bytes(n):  # pretty-print in GiB
+    return f"{n / (1024**3):.3f} GiB"
+
+def log_cuda_mem(tag="", device=None, sync=True):
+    if not torch.cuda.is_available():
+        print(f"[{tag}] CUDA not available")
+        return
+    device = torch.cuda.current_device() if device is None else device
+    if sync:
+        torch.cuda.synchronize(device)  # optional; see note below
+    alloc = torch.cuda.memory_allocated(device)
+    rsv   = torch.cuda.memory_reserved(device)
+    free, total = torch.cuda.mem_get_info(device)
+    peak  = torch.cuda.max_memory_allocated(device)
+    print(
+        f"[{tag}] alloc={_fmt_bytes(alloc)} | reserved={_fmt_bytes(rsv)} | "
+        f"peak={_fmt_bytes(peak)} | free/total={_fmt_bytes(free)}/{_fmt_bytes(total)}"
+    )
 
 
+torch.backends.cuda.matmul.allow_tf32 = True   # safe with bf16 models; speeds up FP32 remnants
+torch.backends.cudnn.allow_tf32 = True
 
 class ImageDataset(torch.utils.data.Dataset):
     def __init__(
@@ -27,6 +52,9 @@ class ImageDataset(torch.utils.data.Dataset):
             max_pixels = args.max_pixels
             data_file_keys = args.data_file_keys.split(",")
             repeat = args.dataset_repeat
+            self.args = args
+        else:
+            self.args = None
             
         self.base_path = base_path
         self.max_pixels = max_pixels
@@ -167,7 +195,9 @@ class VideoDataset(torch.utils.data.Dataset):
             num_frames = args.num_frames
             data_file_keys = args.data_file_keys.split(",")
             repeat = args.dataset_repeat
-        
+            self.args = args
+        else:
+            self.args = None
         self.base_path = base_path
         self.num_frames = num_frames
         self.time_division_factor = time_division_factor
@@ -352,8 +382,6 @@ class DiffusionTrainingModule(torch.nn.Module):
             if "lora_A.weight" in key or "lora_B.weight" in key:
                 new_key = key.replace("lora_A.weight", "lora_A.default.weight").replace("lora_B.weight", "lora_B.default.weight")
                 new_state_dict[new_key] = value
-            elif "lora_A.default.weight" in key or "lora_B.default.weight" in key:
-                new_state_dict[key] = value
         return new_state_dict
 
 
@@ -401,15 +429,33 @@ class ModelLogger:
             self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
 
 
-    def save_model(self, accelerator, model, file_name):
+    def save_model(self, accelerator, model, file_name, merge_full=False):
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             state_dict = accelerator.get_state_dict(model)
-            state_dict = accelerator.unwrap_model(model).export_trainable_state_dict(state_dict, remove_prefix=self.remove_prefix_in_ckpt)
+            state_dict = accelerator.unwrap_model(model).export_trainable_state_dict(
+                state_dict, remove_prefix=self.remove_prefix_in_ckpt
+            )
             state_dict = self.state_dict_converter(state_dict)
             os.makedirs(self.output_path, exist_ok=True)
             path = os.path.join(self.output_path, file_name)
             accelerator.save(state_dict, path, safe_serialization=True)
+
+        ckpt_dir = os.path.join(self.output_path, "ckpt_dir")
+        accelerator.save_state(ckpt_dir)
+
+        accelerator.wait_for_everyone()
+        if merge_full and accelerator.is_main_process:
+            from accelerate.utils import merge_fsdp_weights
+            subdirs = [d for d in os.listdir(ckpt_dir) if d.startswith("pytorch_model")]
+            if not subdirs:
+                raise RuntimeError(f"No FSDP model shards found under {ckpt_dir}")
+            src_subdir = sorted(subdirs)[0]
+            src_path = os.path.join(ckpt_dir, src_subdir)
+
+            out_dir = os.path.join(self.output_path, "merged")
+            os.makedirs(out_dir, exist_ok=True)
+            merge_fsdp_weights(src_path, out_dir, safe_serialization=True)
 
 
 def launch_training_task(
@@ -418,31 +464,100 @@ def launch_training_task(
     model_logger: ModelLogger,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
-    num_workers: int = 8,
+    num_workers: int = 4,
     save_steps: int = None,
     num_epochs: int = 1,
     gradient_accumulation_steps: int = 1,
     find_unused_parameters: bool = False,
 ):
-    dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
+    dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers, pin_memory=True, persistent_workers=True)
+    project_dir = model_logger.output_path
+    logging_dir = os.getenv("WANDB_DIR", os.path.join(project_dir, "wandb"))
+    project_config = ProjectConfiguration(project_dir=project_dir, logging_dir=logging_dir)
     accelerator = Accelerator(
+        log_with="wandb",
+        project_config=project_config,
         gradient_accumulation_steps=gradient_accumulation_steps,
         kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=find_unused_parameters)],
+    ) # no-dir logging
+    wandb_run_name = os.getenv("WANDB_RUN_PREFIX", None)
+    init_signature = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    init_signature = f"{wandb_run_name}_{init_signature}" if wandb_run_name else init_signature
+    cfg = None
+    if hasattr(dataset, "args") and dataset.args is not None:
+        try:
+            cfg = vars(dataset.args)
+        except Exception:
+            pass
+    accelerator.init_trackers(
+        project_name=os.getenv("WANDB_PROJECT", "qwen-image-full"),
+        config=cfg,
+        init_kwargs={
+            "wandb": {
+                "name": os.getenv("WANDB_NAME", init_signature),
+            }
+        },
     )
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
-    
+    log_every = int(os.getenv("WANDB_LOG_EVERY", "50"))
+    global_step = 0
+    torch.cuda.reset_peak_memory_stats()
+    log_cuda_mem("before forward", device=0)
     for epoch_id in range(num_epochs):
+        step_start = datetime.datetime.now()
         for data in tqdm(dataloader):
+            t0 = time.perf_counter()
             with accelerator.accumulate(model):
-                optimizer.zero_grad()
+                t1 = time.perf_counter()
                 loss = model(data)
                 accelerator.backward(loss)
-                optimizer.step()
+                log_cuda_mem("after backward")
+                t2 = time.perf_counter()
+                if accelerator.sync_gradients:
+                    global_step += 1
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    log_cuda_mem("after optimizer step")
+                    if (global_step % log_every) == 0:
+                        lr = None
+                        try:
+                            lr = scheduler.get_last_lr()[0]
+                        except Exception:
+                            for pg in optimizer.param_groups:
+                                if "lr" in pg:
+                                    lr = pg["lr"]; break
+                        # Memory (per process), step time
+                        now = datetime.datetime.now()
+                        step_time = (now - step_start).total_seconds()
+                        step_start = now
+                        max_mem_gb = 0.0
+                        if torch.cuda.is_available():
+                            max_mem_gb = torch.cuda.max_memory_allocated() / 1e9
+                        t3 = time.perf_counter()
+                        total_time = t3 - t0
+                        accelerator.log(
+                            {
+                                "train/loss": float(loss.item()),
+                                "train/lr": float(lr) if lr is not None else 0.0,
+                                "sys/max_mem_gb": float(max_mem_gb),
+                                "time/step_s": float(step_time),
+                                "time/data_s": t1 - t0,
+                                "time/forward_backward_s": t2 - t1,
+                                "time/optimizer_s": t3 - t2,
+                                "time/data_s_percentile": (t1 - t0) / total_time * 100 if total_time > 0 else 0,
+                                "time/forward_backward_s_percentile": (t2 - t1) / total_time * 100 if total_time > 0 else 0,
+                                "time/optimizer_s_percentile": (t3 - t2) / total_time * 100 if total_time > 0 else 0,
+                            },
+                            step=global_step,
+                        )
                 model_logger.on_step_end(accelerator, model, save_steps)
-                scheduler.step()
+                
+                
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
     model_logger.on_training_end(accelerator, model, save_steps)
+    accelerator.end_training()
 
 
 def launch_data_process_task(model: DiffusionTrainingModule, dataset, output_path="./models"):
@@ -554,5 +669,6 @@ def qwen_image_parser():
     parser.add_argument("--save_steps", type=int, default=None, help="Number of checkpoint saving invervals. If None, checkpoints will be saved every epoch.")
     parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
-    parser.add_argument("--processor_path", type=str, default=None, help="Path to the processor. If provided, the processor will be used for image editing.")
+    parser.add_argument("--use_8bit_adam", default=False, action="store_true", help="Whether to use 8-bit Adam optimizer.")
+    parser.add_argument("--use_8bit_paged_adam", default=False, action="store_true", help="Whether to use 8-bit Paged Adam optimizer.")
     return parser
