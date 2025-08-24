@@ -1,183 +1,166 @@
 #!/usr/bin/env python3
-import os
-import json
-import csv
-import argparse
-import hashlib
+# -*- coding: utf-8 -*-
+
+import os, json, csv, argparse, hashlib
 from collections import OrderedDict, Counter
 from glob import glob
-
+from typing import List, Tuple, Optional
 import torch
 
-# 선택적: tqdm 사용 (없어도 동작)
 try:
     from tqdm import tqdm
 except Exception:
     tqdm = lambda x, **k: x
 
-# DiffSynth 파이프라인이 있는 경우 사용
-# (Proj 환경에 따라 import 경로가 다를 수 있음)
-try:
-    from diffsynth.pipelines.qwen_image import QwenImagePipeline, ModelConfig
-    HAS_DIFFSYNTH = True
-except Exception:
-    HAS_DIFFSYNTH = False
-
-
+# -----------------------------
+# 유틸
+# -----------------------------
 def stable_id_from_prompt(p: str) -> str:
-    """런타임 및 파이썬 버전과 무관한 안정적 해시 ID 생성"""
     return hashlib.blake2b(p.encode("utf-8"), digest_size=12).hexdigest()
 
-
 def normalize_prompt(p: str, do_strip: bool, do_norm_ws: bool, do_lower: bool) -> str:
-    if p is None:
-        return ""
+    if p is None: return ""
     s = p
-    if do_strip:
-        s = s.strip()
-    if do_norm_ws:
-        # 연속 공백을 단일 스페이스로
-        s = " ".join(s.split())
-    if do_lower:
-        s = s.lower()
+    if do_strip: s = s.strip()
+    if do_norm_ws: s = " ".join(s.split())
+    if do_lower: s = s.lower()
     return s
 
-
-def read_prompts_from_csv(csv_path: str, text_column: str | None, sep: str | None):
-    """CSV에서 프롬프트 컬럼을 읽어 리스트 반환 (중복 포함)"""
+def read_prompts_from_csv(csv_path: str, text_column: Optional[str], sep: Optional[str]) -> List[str]:
     if not os.path.isfile(csv_path):
-        raise FileNotFoundError(f"metadata csv not found: {csv_path}")
-
-    # 컬럼 자동 추론 후보
-    candidates = ["caption", "prompt", "text", "prompt_text", "input_text", "captions"]
-    prompts = []
-    with open(csv_path, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        headers = reader.fieldnames or []
-        col = text_column
-        if col is None:
-            # 자동 추론
-            for c in candidates:
-                if c in headers:
-                    col = c
-                    break
-        if col is None:
-            raise ValueError(
-                f"텍스트 컬럼을 찾지 못했습니다. --text-column 로 지정하거나 "
-                f"다음 후보 중 하나를 사용하세요: {candidates}. 현재 헤더: {headers}"
-            )
-
-        for row in reader:
-            raw = row.get(col, "")
-            if not raw:
-                continue
-            if sep and sep in raw:
-                items = [x for x in raw.split(sep) if x.strip()]
-                prompts.extend(items)
-            else:
-                prompts.append(raw)
+        raise FileNotFoundError(f"[prompt-cache] metadata csv not found: {csv_path}")
+    candidates = ["caption","prompt","text","prompt_text","input_text","captions"]
+    prompts: List[str] = []
+    opened = False
+    for enc in ("utf-8","utf-8-sig"):
+        try:
+            with open(csv_path,"r",encoding=enc,newline="") as f:
+                reader = csv.DictReader(f)
+                headers = reader.fieldnames or []
+                col = text_column
+                if col is not None and col not in headers:
+                    raise ValueError(f"[prompt-cache] --text-column '{col}' not in headers {headers}")
+                if col is None:
+                    for c in candidates:
+                        if c in headers:
+                            col = c; break
+                if col is None:
+                    raise ValueError(f"[prompt-cache] cannot find text column. headers={headers}, candidates={candidates}")
+                for row in reader:
+                    raw = row.get(col,"")
+                    if not raw: continue
+                    if sep and sep in raw:
+                        prompts.extend([x for x in raw.split(sep) if x.strip()])
+                    else:
+                        prompts.append(raw)
+                opened = True
+            break
+        except UnicodeDecodeError:
+            continue
+    if not opened:
+        raise UnicodeDecodeError("utf-8/utf-8-sig", b"", 0, 1, "[prompt-cache] CSV decode failed")
     return prompts
 
-
-def build_pipe_from_paths(model_paths_csv: str, device: str) -> "QwenImagePipeline":
-    if not HAS_DIFFSYNTH:
-        raise RuntimeError(
-            "DiffSynth 파이프라인 import 실패: "
-            "from diffsynth.pipelines.qwen_image import QwenImagePipeline, ModelConfig"
-        )
-
-    from glob import glob
-    uniq_dirs = []
-    for part in model_paths_csv.split(","):
+def _list_dirs_from_model_paths(model_paths_csv: str) -> list[str]:
+    dirs = []
+    for part in (model_paths_csv or "").split(","):
         part = part.strip()
+        if not part: continue
         matches = sorted(glob(part)) or [part]
         for m in matches:
             d = os.path.dirname(m) if os.path.isfile(m) else m
-            if d not in uniq_dirs:
-                uniq_dirs.append(d)
+            if d not in dirs:
+                dirs.append(d)
+    return dirs
 
-    # 폴더명 기반 힌트 매핑
-    def guess_model_name_by_dir(path: str) -> str | None:
-        lower = path.lower().rstrip("/")
+def find_text_encoder_dir_from_model_paths(model_paths_csv: str) -> Optional[str]:
+    for d in _list_dirs_from_model_paths(model_paths_csv):
+        name = os.path.basename(d).lower().replace("-","_")
+        if name == "text_encoder": return d
+    for d in _list_dirs_from_model_paths(model_paths_csv):
+        low = os.path.basename(d).lower()
+        if "text" in low and "encod" in low:
+            return d
+    return None
 
-        # Qwen-Image 표준 폴더명
-        if lower.endswith("/transformer"):
-            # 감지 실패를 회피하기 위해 변환기를 명시적으로 지정
-            return "qwen_image_dit"   # (= QwenImageDiT)
-        if lower.endswith("/text_encoder") or lower.endswith("/text-encoder"):
-            return "qwen_image_text_encoder"
-        if lower.endswith("/vae"):
-            return "qwen_image_vae"
+def _likely_tokenizer_dir(path: str) -> bool:
+    if not os.path.isdir(path): return False
+    files = set(os.listdir(path))
+    # 흔한 토크나이저 파일들
+    needed_any = {"tokenizer.json","vocab.json","merges.txt","tokenizer.model","spiece.model","tokenizer_config.json"}
+    return len(files & needed_any) > 0
 
-        # 그 외 흔한 별칭 대응(선택)
-        if lower.endswith("/unet"):
-            return "qwen_image_dit"   # 프로젝트에 따라 다를 수 있음
-        return None
+def find_tokenizer_dir_from_model_paths(model_paths_csv: str) -> Optional[str]:
+    # 우선순위: tokenizer → processor → 기타에 토크나이저 파일이 있는 폴더
+    candidates = []
+    for d in _list_dirs_from_model_paths(model_paths_csv):
+        base = os.path.basename(d).lower().replace("-","_")
+        if base == "tokenizer": candidates.append(d)
+    for d in _list_dirs_from_model_paths(model_paths_csv):
+        base = os.path.basename(d).lower().replace("-","_")
+        if base == "processor": candidates.append(d)
+    # 그 외 모든 디렉터리에서 토크나이저 파일 보유 여부 검사
+    for d in _list_dirs_from_model_paths(model_paths_csv):
+        if _likely_tokenizer_dir(d): candidates.append(d)
+    for c in candidates:
+        if _likely_tokenizer_dir(c):
+            return c
+    return None
 
-    model_configs = []
-    for d in uniq_dirs:
-        hinted = guess_model_name_by_dir(d)
-        if hinted is not None:
-            # 힌트를 명시해서 아키텍처 자동 감지를 건너뜀
-            mc = ModelConfig(path=d, model_name=hinted)
+# -----------------------------
+# HF 토크나이저/모델 로딩
+# -----------------------------
+def load_hf_text_encoder(tokenizer_path: str, text_encoder_path: str, device: str):
+    from transformers import AutoTokenizer, AutoModel
+    if not os.path.isdir(text_encoder_path):
+        raise FileNotFoundError(f"[prompt-cache] text_encoder path not found: {text_encoder_path}")
+    if not os.path.isdir(tokenizer_path):
+        raise FileNotFoundError(f"[prompt-cache] tokenizer path not found: {tokenizer_path}")
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+    model = AutoModel.from_pretrained(text_encoder_path, trust_remote_code=True)
+
+    # pad 토큰 보정
+    if tokenizer.pad_token is None:
+        if tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
         else:
-            mc = ModelConfig(path=d)  # 감지에 맡김(가능한 경우)
-        model_configs.append(mc)
+            tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+            try:
+                model.resize_token_embeddings(len(tokenizer))
+            except Exception:
+                pass
 
-    dtype = torch.bfloat16 if device == "cuda" else torch.float32
-    pipe = QwenImagePipeline.from_pretrained(
-        torch_dtype=dtype,
-        device=device,
-        model_configs=model_configs
-    )
-    return pipe
-
-
+    model.eval().to(device)
+    return tokenizer, model
 
 @torch.inference_mode()
-def encode_batch_with_pipe(pipe, texts: list[str], device: str):
-    """
-    가능한 경우 pipe.encode_prompt 사용,
-    아니면 tokenizer/text_encoder 직접 호출.
-    반환: (pe, pm) 모두 CPU 텐서
-    """
-    if hasattr(pipe, "encode_prompt"):
-        pe, pm = pipe.encode_prompt(texts)
-        # encode_prompt가 반환하는 텐서가 GPU일 수 있으므로 CPU로 이동
-        pe = pe.detach().to("cpu")
-        pm = pm.detach().to("cpu").to(torch.int64)
-        return pe, pm
-
-    # Fallback: tokenizer + text_encoder 직접 접근
-    if not hasattr(pipe, "tokenizer") or not hasattr(pipe, "text_encoder"):
-        raise RuntimeError(
-            "파이프라인에 encode_prompt도, tokenizer/text_encoder도 없어 텍스트 인코딩이 불가합니다."
-        )
-
-    tok = pipe.tokenizer(
-        texts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True
-    )
+def encode_batch_hf(tokenizer, model, texts: List[str], device: str, max_length: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    kwargs = dict(return_tensors="pt", padding=True, truncation=True)
+    if max_length: kwargs["max_length"] = max_length
+    tok = tokenizer(texts, **kwargs)
     tok = {k: v.to(device) for k, v in tok.items()}
-
-    enc = pipe.text_encoder(**tok)
-    if hasattr(enc, "last_hidden_state"):
-        pe = enc.last_hidden_state
-    elif isinstance(enc, (list, tuple)):
-        pe = enc[0]
+    out = model(**tok)
+    if hasattr(out, "last_hidden_state"):
+        pe = out.last_hidden_state
+    elif isinstance(out,(list,tuple)) and len(out)>0:
+        pe = out[0]
+    elif isinstance(out,dict) and "last_hidden_state" in out:
+        pe = out["last_hidden_state"]
     else:
-        pe = enc
-
+        raise RuntimeError("[prompt-cache] last_hidden_state not found in model output")
     pm = tok["attention_mask"]
     return pe.detach().to("cpu"), pm.detach().to("cpu").to(torch.int64)
 
-
+# -----------------------------
+# 캐시 빌더
+# -----------------------------
 def build_prompt_cache(
-    model_paths: str,
-    prompts: list[str],
+    *,
+    prompts: List[str],
     index_path: str,
+    text_encoder_path: str,
+    tokenizer_path: str,
     device: str = "cpu",
     batch_size: int = 64,
     normalize_ws: bool = False,
@@ -185,115 +168,106 @@ def build_prompt_cache(
     strip: bool = True,
     make_absolute_paths: bool = True,
     resume: bool = True,
+    max_length: Optional[int] = None,
 ):
-    """
-    prompts(중복 포함)에서 유니크를 추출하여
-    {원문 프롬프트: 캐시 파일 절대경로} 형태의 index.json 생성 + 임베딩 저장.
-    """
     out_dir = os.path.dirname(index_path)
     emb_dir = os.path.join(out_dir, "embeds")
     os.makedirs(emb_dir, exist_ok=True)
 
-    # 기존 인덱스가 있으면 이어서 (resume)
-    index: dict[str, str] = OrderedDict()
+    index: "OrderedDict[str,str]" = OrderedDict()
     if resume and os.path.isfile(index_path):
-        with open(index_path, "r", encoding="utf-8") as f:
+        with open(index_path,"r",encoding="utf-8") as f:
             try:
                 index = json.load(f, object_pairs_hook=OrderedDict)
             except Exception:
-                print("[WARN] 기존 index.json 파싱 실패. 새로 작성합니다.")
-                index = OrderedDict()
+                print("[WARN] 기존 index.json 파싱 실패. 새로 작성합니다."); index = OrderedDict()
 
-    # 전처리(옵션)
     def norm(p: str) -> str:
         return normalize_prompt(p, do_strip=strip, do_norm_ws=normalize_ws, do_lower=lowercase)
 
-    # 빈 문자열 제거
-    raw_prompts = [p for p in prompts if isinstance(p, str) and p.strip()]
-    # 빈도 카운트(디버그/로그용)
+    raw_prompts = [p for p in prompts if isinstance(p,str) and p.strip()]
     counts = Counter(raw_prompts)
-
-    # 유니크(원문 기준)
     uniq_raw = list(OrderedDict.fromkeys(raw_prompts))
+    print(f"[prompt-cache] 총 프롬프트 수: {len(raw_prompts)} (유니크: {len(uniq_raw)})")
 
-    # 파이프라인 로드
-    pipe = build_pipe_from_paths(model_paths, device=device)
+    tokenizer, model = load_hf_text_encoder(tokenizer_path, text_encoder_path, device=device)
 
-    # 배치 처리
     to_process = []
     for p in uniq_raw:
-        key = p  # 키는 **원문** 그대로 사용합니다.
-        if key in index and os.path.isfile(index[key]):
-            continue
+        if p in index and os.path.isfile(index[p]): continue
         to_process.append(p)
-
-    print(f"[prompt-cache] 총 프롬프트 수: {len(raw_prompts)} (유니크: {len(uniq_raw)})")
     print(f"[prompt-cache] 새로 인코딩할 개수: {len(to_process)}")
     if len(to_process) == 0:
-        print("[prompt-cache] 추가 작업 없음. index.json 갱신만 수행합니다.")
+        with open(index_path,"w",encoding="utf-8") as f: json.dump(index,f,ensure_ascii=False,indent=2)
+        print(f"[prompt-cache] 완료: {index_path}")
+        return
 
-    # 인코딩 & 저장
-    for i in tqdm(range(0, len(to_process), batch_size), desc="Encoding prompts"):
-        batch = to_process[i:i + batch_size]
-        # (선택) 정규화는 저장되는 임베딩에만 사용 (키는 원문)
+    for i in tqdm(range(0,len(to_process),batch_size), desc="Encoding prompts"):
+        batch = to_process[i:i+batch_size]
         batch_norm = [norm(p) for p in batch]
-
-        pe, pm = encode_batch_with_pipe(pipe, batch_norm, device=device)
-        # pe: [B, T, C], pm: [B, T]
-
+        pe, pm = encode_batch_hf(tokenizer, model, batch_norm, device=device, max_length=max_length)
         for j, raw_p in enumerate(batch):
-            pid = stable_id_from_prompt(raw_p)  # 원문 기준으로 ID 생성
+            pid = stable_id_from_prompt(raw_p)
             fpath = os.path.join(emb_dir, f"{pid}.pt")
-            torch.save(
-                {"prompt_emb": pe[j], "prompt_emb_mask": pm[j]},
-                fpath
-            )
-            if make_absolute_paths:
-                fpath_to_store = os.path.abspath(fpath)
-            else:
-                # index.json과 동일 폴더 기준 상대경로가 필요하다면:
-                fpath_to_store = os.path.relpath(fpath, start=out_dir)
-            index[raw_p] = fpath_to_store
+            torch.save({"prompt_emb": pe[j], "prompt_emb_mask": pm[j]}, fpath)
+            index[raw_p] = os.path.abspath(fpath) if make_absolute_paths else os.path.relpath(fpath, start=out_dir)
+        with open(index_path,"w",encoding="utf-8") as f:
+            json.dump(index,f,ensure_ascii=False,indent=2)
 
-        # 중간 저장(안전)
-        with open(index_path, "w", encoding="utf-8") as f:
-            json.dump(index, f, ensure_ascii=False, indent=2)
-
-    # 최종 저장
-    with open(index_path, "w", encoding="utf-8") as f:
-        json.dump(index, f, ensure_ascii=False, indent=2)
-
+    with open(index_path,"w",encoding="utf-8") as f:
+        json.dump(index,f,ensure_ascii=False,indent=2)
     print(f"[prompt-cache] 완료: {index_path}")
-    # 간단 검증: 임의 샘플 1개
-    if len(index) > 0:
+    if len(index)>0:
         sample_k = next(iter(index.keys()))
         sample_path = index[sample_k]
-        ok = os.path.isfile(sample_path)
-        print(f"[prompt-cache] 샘플 확인: {sample_k!r} -> {sample_path} (exists={ok})")
+        print(f"[prompt-cache] 샘플 확인: {sample_k!r} -> {sample_path} (exists={os.path.isfile(sample_path)})")
 
-
+# -----------------------------
+# CLI
+# -----------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Build prompt cache index (프롬프트 임베딩 캐시 생성기)")
-    ap.add_argument("--metadata", required=True, help="데이터셋 메타데이터 CSV 경로 (예: ./pochacco/metadata.csv)")
-    ap.add_argument("--text-column", default=None, help="프롬프트가 들어있는 컬럼명 (미지정 시 자동 추론)")
-    ap.add_argument("--split-sep", default=None, help="하나의 셀에 복수 프롬프트가 있을 때 구분자 (예: '|||')")
+    ap = argparse.ArgumentParser(description="Build prompt cache index (HF text-encoder + tokenizer 분리)")
+    ap.add_argument("--metadata", required=True, help="CSV 경로 (예: ./pochacco/metadata.csv)")
+    ap.add_argument("--text-column", default=None, help="프롬프트 컬럼명 (미지정 시 자동 탐지)")
+    ap.add_argument("--split-sep", default=None, help="한 셀에 여러 프롬프트일 때 구분자")
     ap.add_argument("--index-path", required=True, help="생성할 index.json 경로")
-    ap.add_argument("--model-paths", required=True, help="콤마로 구분된 모델(글롭) 경로들 (학습 시 --model_id_with_origin_paths와 동일하게 사용 권장)")
-    ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"], help="인코딩 수행 장치 (기본 cpu)")
+
+    # 경로 지정: 명시적 또는 model-paths에서 자동탐지
+    ap.add_argument("--text-encoder-path", default=None, help="text_encoder 디렉터리 경로(가중치)")
+    ap.add_argument("--tokenizer-path", default=None, help="tokenizer/processor 디렉터리 경로(토크나이저 파일들)")
+    ap.add_argument("--model-paths", default=None, help="(선택) 콤마구분 경로들에서 text_encoder/tokenizer 자동탐지")
+
+    ap.add_argument("--device", default="cpu", choices=["cpu","cuda"])
     ap.add_argument("--batch-size", type=int, default=64)
-    ap.add_argument("--normalize-whitespace", action="store_true", help="공백 정규화 수행")
-    ap.add_argument("--lowercase", action="store_true", help="소문자화 수행")
-    ap.add_argument("--no-strip", action="store_true", help="앞뒤 공백 제거하지 않음")
-    ap.add_argument("--relative-paths", action="store_true", help="index.json에 상대경로 저장 (기본은 절대경로)")
-    ap.add_argument("--no-resume", action="store_true", help="기존 index.json 무시하고 처음부터 생성")
+    ap.add_argument("--max-length", type=int, default=None)
+    ap.add_argument("--normalize-whitespace", action="store_true")
+    ap.add_argument("--lowercase", action="store_true")
+    ap.add_argument("--no-strip", action="store_true")
+    ap.add_argument("--relative-paths", action="store_true")
+    ap.add_argument("--no-resume", action="store_true")
     args = ap.parse_args()
+
+    te_path = args.text_encoder_path
+    tok_path = args.tokenizer_path
+
+    if (te_path is None or tok_path is None) and args.model_paths:
+        if te_path is None:
+            te_path = find_text_encoder_dir_from_model_paths(args.model_paths)
+        if tok_path is None:
+            tok_path = find_tokenizer_dir_from_model_paths(args.model_paths)
+
+    if te_path is None:
+        raise ValueError("[prompt-cache] text_encoder 경로를 찾지 못했습니다. --text-encoder-path 지정 또는 --model-paths에 포함하세요.")
+    if tok_path is None:
+        raise ValueError("[prompt-cache] tokenizer 경로를 찾지 못했습니다. --tokenizer-path 지정 또는 --model-paths에 tokenizer/processor 포함하세요.")
 
     prompts = read_prompts_from_csv(args.metadata, args.text_column, args.split_sep)
 
     build_prompt_cache(
-        model_paths=args.model_paths,
         prompts=prompts,
         index_path=args.index_path,
+        text_encoder_path=te_path,
+        tokenizer_path=tok_path,
         device=args.device,
         batch_size=args.batch_size,
         normalize_ws=args.normalize_whitespace,
@@ -301,8 +275,8 @@ def main():
         strip=not args.no_strip,
         make_absolute_paths=not args.relative_paths,
         resume=not args.no_resume,
+        max_length=args.max_length,
     )
-
 
 if __name__ == "__main__":
     main()
