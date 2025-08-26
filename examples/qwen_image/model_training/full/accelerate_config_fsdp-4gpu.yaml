@@ -21,7 +21,7 @@ fsdp_config:
   fsdp_sharding_strategy: FULL_SHARD
   fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
   fsdp_transformer_layer_cls_to_wrap: QwenImageDiT,QwenImageTransformerBlock # here
-  fsdp_backward_prefetch_policy: BACKWARD_PRE
+  fsdp_backward_prefetch_policy: BACKWARD_POST
   fsdp_forward_prefetch: false
   fsdp_offload_params: false
   fsdp_state_dict_type: SHARDED_STATE_DICT
